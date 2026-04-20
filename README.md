@@ -70,7 +70,7 @@ HOW TO EMBED Demo.mp4 (it's too big for git but GitHub can host it for free):
 
 <!-- replace the next line with the user-attachments URL from step 3 -->
 
-[Watch Demo](./demo.mp4)
+https://github.com/user-attachments/assets/5d258e06-203f-4491-914b-0e9d5ce3f3ec
 
 
 ## 📦 Key Features
