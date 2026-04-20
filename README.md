@@ -18,7 +18,7 @@ The project is inspired by ideas from modern AI systems like Dreamer and self-dr
 - Uses a reward function to decide what good behavior looks like
 - Plans step by step to follow a route, avoid crashing, and reach the goal
 
-## ⚙️ How it works (simple idea)
+## ⚙️ How it works
 
 The project has three main steps.
 
