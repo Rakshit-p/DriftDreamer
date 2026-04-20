@@ -1,0 +1,14 @@
+# Python deps for DriftDreamer (world-model trainer, CEM-MPC planner,
+# and Gazebo data collectors).
+#
+# Gazebo itself is NOT a pip package — install it separately via Homebrew
+# on macOS:   brew install gz-sim10
+# The collectors fall back to `gz topic` subprocess calls when the
+# `gz.transport13` Python bindings are not importable, so the bindings
+# are optional here.
+
+torch>=2.0.0
+numpy>=1.21.0
+PyYAML>=6.0
+attrdict>=2.0.1
+tensorboard>=2.8.0

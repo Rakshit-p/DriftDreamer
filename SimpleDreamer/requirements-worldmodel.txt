@@ -1,0 +1,6 @@
+# Minimal deps for train_tugbot_world_model.py (no DMC / gym / MuJoCo).
+torch>=2.0.0
+PyYAML>=6.0
+numpy>=1.21.0
+attrdict>=2.0.1
+tensorboard>=2.8.0

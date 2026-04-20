@@ -1,0 +1,42 @@
+# macOS
+.DS_Store
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+
+# IDEs
+.vscode/
+.idea/
+
+# TensorBoard / training logs
+SimpleDreamer/runs/
+runs/
+*.tfevents.*
+
+# MPC run outputs
+run_logs/
+mpc_run_*.csv
+mpc_route_metrics.csv
+
+# Generic logs
+*.log
+
+# Video files (GitHub rejects files > 100 MB)
+# Host Demo.mp4 on YouTube / Google Drive / a Release asset and link it in the README.
+*.mp4
+*.mov
+
+# ── Optional ignores (uncomment if you don't want these tracked) ────────────
+# Trajectory datasets can be regenerated with `collect_trajectories.py`.
+# trajectories*.npz
+
+# Model checkpoints are ~1 MB each. Currently tracked so the demo works out
+# of the box. Uncomment to distribute via Releases instead.
+# SimpleDreamer/checkpoints/*.pt

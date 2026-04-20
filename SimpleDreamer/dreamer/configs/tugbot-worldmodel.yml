@@ -1,0 +1,56 @@
+# Offline world-model training for vector observations (tugbot depot).
+# Used by train_tugbot_world_model.py — not by main.py.
+
+operation:
+  device: cpu   # override with --device cuda | mps | cpu
+
+parameters:
+  dreamer:
+    train_steps: 5000
+    batch_size: 64
+    batch_length: 2          # (s, s') one transition per sequence
+    kl_divergence_scale: 1.0
+    free_nats: 1.0
+    model_learning_rate: 0.0003
+    grad_norm_type: 2
+    clip_grad: 100.0
+
+    stochastic_size: 24
+    deterministic_size: 128
+    embedded_state_size: 64
+
+    rssm:
+      recurrent_model:
+        hidden_size: 128
+        activation: ELU
+      transition_model:
+        hidden_size: 200
+        num_layers: 2
+        activation: ELU
+        min_std: 0.1
+      representation_model:
+        hidden_size: 200
+        num_layers: 2
+        activation: ELU
+        min_std: 0.1
+
+    encoder:
+      hidden_size: 256
+      num_layers: 2
+      activation: ELU
+
+    decoder:
+      hidden_size: 256
+      num_layers: 2
+      activation: ELU
+      min_std: 0.05
+
+    # Goal-conditioned reward head (see SimpleDreamer/cardreamer_reward.py).
+    # Input: posterior_z || deterministic_h || relative_goal(3,).  Output: scalar reward.
+    reward_head:
+      hidden_size: 128
+      num_layers: 2
+      activation: ELU
+      scale: 1.0                  # weight in the joint training loss
+      goal_radius_range: [0.5, 3.0]   # synthetic goals sampled uniform in this annulus
+      forward_bias: 0.3               # prob. of sampling the goal in the ego forward half-plane
