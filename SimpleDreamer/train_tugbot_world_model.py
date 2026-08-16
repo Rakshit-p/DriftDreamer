@@ -17,6 +17,7 @@ for _name in collections.abc.__all__:
     setattr(collections, _name, getattr(collections.abc, _name))
 
 import argparse
+import math
 import os
 from datetime import datetime
 from pathlib import Path
@@ -371,8 +372,15 @@ def eval_multistep_imagination(
     teacher_steps: int = 1,
     open_steps: int = 12,
     probe_ks: tuple[int, ...] = (1, 4, 12),
+    pose_dim: int = 5,
 ) -> dict[str, float]:
-    """Measure prior-rollout reconstruction MSE at k = 1, 4, 12 steps after teacher-forcing."""
+    """Measure prior-rollout reconstruction MSE at each ``probe_ks`` step.
+
+    Besides the total MSE over all dims, this also reports the MSE
+    restricted to the pose block (first ``pose_dim`` dims) and to the lidar
+    block (the rest), so pose drift can be tracked separately from lidar
+    prediction quality.
+    """
     T = obs.shape[1]
     if T < teacher_steps + open_steps + 1:
         return {}
@@ -390,22 +398,54 @@ def eval_multistep_imagination(
         _, posterior = rssm.representation_model(embedded[:, t], deterministic)
         latent = posterior
 
-    recon_errs: list[torch.Tensor] = []
+    per_dim_errs: list[torch.Tensor] = []
     for t in range(teacher_steps + 1, teacher_steps + open_steps + 1):
         deterministic = rssm.recurrent_model(latent, act[:, t - 1], deterministic)
         _, prior_sample = rssm.transition_model(deterministic)
         latent = prior_sample
         x_hat = decoder(latent.unsqueeze(1), deterministic.unsqueeze(1)).mean.squeeze(1)
-        mse = ((x_hat - obs[:, t]) ** 2).mean(dim=-1)
-        recon_errs.append(mse)
+        per_dim_errs.append((x_hat - obs[:, t]) ** 2)
 
-    errs = torch.stack(recon_errs, dim=1)
+    errs_per_dim = torch.stack(per_dim_errs, dim=1)
+    errs = errs_per_dim.mean(dim=-1)
+    obs_dim = errs_per_dim.shape[-1]
+    pose_errs = errs_per_dim[..., :pose_dim].mean(dim=-1) if pose_dim > 0 else None
+    lidar_errs = errs_per_dim[..., pose_dim:].mean(dim=-1) if obs_dim > pose_dim else None
+
     out: dict[str, float] = {}
     for k in probe_ks:
         if 1 <= k <= open_steps:
             out[f"multistep_mse_k{k}"] = float(errs[:, k - 1].mean().cpu())
+            if pose_errs is not None:
+                out[f"multistep_mse_pose_k{k}"] = float(pose_errs[:, k - 1].mean().cpu())
+            if lidar_errs is not None:
+                out[f"multistep_mse_lidar_k{k}"] = float(lidar_errs[:, k - 1].mean().cpu())
     out["multistep_mse_mean"] = float(errs.mean().cpu())
+    if pose_errs is not None:
+        out["multistep_mse_pose_mean"] = float(pose_errs.mean().cpu())
+    if lidar_errs is not None:
+        out["multistep_mse_lidar_mean"] = float(lidar_errs.mean().cpu())
     return out
+
+
+def resolve_config_path(stored: str | Path) -> Path:
+    """Resolve a checkpoint's ``config_path``, tolerating a foreign machine.
+
+    Checkpoints record an absolute config path from the machine that trained
+    them. When that path is missing (different user, container, or clone
+    location) fall back to the same file name inside this repo's
+    ``dreamer/configs`` directory.
+    """
+    stored_path = Path(stored)
+    if stored_path.is_file():
+        return stored_path
+    local = Path(__file__).resolve().parent / "dreamer" / "configs" / stored_path.name
+    if local.is_file():
+        return local
+    raise FileNotFoundError(
+        f"Config not found at checkpoint path {stored_path} nor at {local}. "
+        f"Pass the config explicitly or re-save the checkpoint."
+    )
 
 
 def load_world_model_bundle(
@@ -417,7 +457,7 @@ def load_world_model_bundle(
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     except TypeError:
         ckpt = torch.load(checkpoint_path, map_location=device)
-    cfg_path = Path(ckpt["config_path"])
+    cfg_path = resolve_config_path(ckpt["config_path"])
     config = load_yaml_config(cfg_path)
     config["operation"]["device"] = str(device)
     obs_dim = int(ckpt["obs_dim"])
@@ -492,6 +532,152 @@ def imagine_with_latents(
         preds.append(dec.mean.squeeze(1))
         z_seq.append(z)
         d_seq.append(d)
+    return (
+        torch.stack(preds, dim=1),
+        torch.stack(z_seq, dim=1),
+        torch.stack(d_seq, dim=1),
+    )
+
+
+def wrap_pi(a: torch.Tensor) -> torch.Tensor:
+    """Wrap angles to ``[-pi, pi)``."""
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+
+@torch.no_grad()
+def imagine_with_latents_hybrid(
+    rssm: RSSM,
+    encoder: MLPEncoder,
+    decoder: VectorDecoder,
+    s0_norm: torch.Tensor,
+    actions: torch.Tensor,
+    device: torch.device,
+    *,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    action_dt: float,
+    pose_mode: str = "position",
+    yaw_mode: str = "mid",
+    v_mode: str = "mid",
+    pose_dim: int = 5,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Hybrid RSSM + exact-kinematics rollout (physics-grounded position).
+
+    Two splice variants are supported:
+
+    ``pose_mode="position"`` (default, "A-prime")
+        Integrate only ``x, y`` with the exact unicycle update, driven by the
+        RSSM's own *decoded* ``yaw`` and ``v``. The ``yaw, v, w`` dimensions
+        are left untouched, so the learned command-to-realised actuator
+        mapping the RSSM already captured is preserved. This avoids feeding
+        the exact integrator a biased commanded-velocity input.
+
+    ``pose_mode="full"``
+        Overwrite all five pose dims using the *commanded* action and an
+        analytically integrated yaw. Kept for A/B comparison -- it assumes
+        the command is realised instantly, which is wrong on a real robot
+        and makes the exact integrator compound that bias.
+
+    ``yaw_mode`` selects which yaw drives ``cos/sin`` over the interval:
+    ``"mid"`` (midpoint of previous and decoded next yaw, 2nd-order),
+    ``"prev"`` (forward Euler) or ``"next"``. ``v_mode`` likewise picks
+    ``"mid"`` or ``"next"`` for the integrated speed.
+
+    Returns ``(preds_norm, z_seq, d_seq)`` with identical shapes to
+    :func:`imagine_with_latents`, so it is a drop-in replacement.
+    """
+    if pose_mode not in ("position", "full"):
+        raise ValueError(f"pose_mode must be 'position' or 'full', got {pose_mode!r}")
+    if yaw_mode not in ("mid", "prev", "next"):
+        raise ValueError(f"yaw_mode must be 'mid', 'prev' or 'next', got {yaw_mode!r}")
+    if v_mode not in ("mid", "next"):
+        raise ValueError(f"v_mode must be 'mid' or 'next', got {v_mode!r}")
+
+    K, H, _ = actions.shape
+    obs_dim = s0_norm.shape[-1]
+    if obs_dim < pose_dim:
+        raise ValueError(f"obs_dim={obs_dim} must be >= pose_dim={pose_dim}")
+    if mean.shape[-1] != obs_dim or std.shape[-1] != obs_dim:
+        raise ValueError(
+            f"mean/std last-dim must equal obs_dim={obs_dim}; "
+            f"got {tuple(mean.shape)} / {tuple(std.shape)}"
+        )
+
+    mean_v = mean.view(1, -1)
+    std_v = std.view(1, -1)
+    mean_pose = mean_v[:, :pose_dim]
+    std_pose = std_v[:, :pose_dim]
+
+    s0_world = s0_norm * std_v + mean_v
+    x_prev = s0_world[:, 0].clone()
+    y_prev = s0_world[:, 1].clone()
+    yaw_prev = s0_world[:, 2].clone()
+    v_prev = s0_world[:, 3].clone()
+
+    obs_in = s0_norm.view(K, 1, obs_dim)
+    emb = encoder(obs_in)
+    z, d = rssm.recurrent_model_input_init(K)
+    z = z.to(device)
+    d = d.to(device)
+    zero_a = torch.zeros(K, 2, device=device, dtype=actions.dtype)
+    d = rssm.recurrent_model(z, zero_a, d)
+    _, z = rssm.representation_model(emb[:, 0], d)
+
+    preds: list[torch.Tensor] = []
+    z_seq: list[torch.Tensor] = []
+    d_seq: list[torch.Tensor] = []
+
+    for t in range(H):
+        a = actions[:, t]
+        d = rssm.recurrent_model(z, a, d)
+        prior_dist, _ = rssm.transition_model(d)
+        z_prior = prior_dist.mean
+        dec = decoder(z_prior.unsqueeze(1), d.unsqueeze(1))
+        pred_norm = dec.mean.squeeze(1)
+        corrected_norm = pred_norm.clone()
+
+        if pose_mode == "full":
+            v_cmd = a[:, 0]
+            w_cmd = a[:, 1]
+            x_new = x_prev + v_cmd * action_dt * torch.cos(yaw_prev)
+            y_new = y_prev + v_cmd * action_dt * torch.sin(yaw_prev)
+            yaw_new = wrap_pi(yaw_prev + w_cmd * action_dt)
+            pose_new = torch.stack([x_new, y_new, yaw_new, v_cmd, w_cmd], dim=-1)
+            corrected_norm[:, :pose_dim] = (pose_new - mean_pose) / std_pose
+            yaw_prev = yaw_new
+            v_prev = v_cmd
+        else:
+            pred_world = pred_norm * std_v + mean_v
+            yaw_next = pred_world[:, 2]
+            v_next = pred_world[:, 3]
+
+            if yaw_mode == "mid":
+                yaw_int = yaw_prev + 0.5 * wrap_pi(yaw_next - yaw_prev)
+            elif yaw_mode == "prev":
+                yaw_int = yaw_prev
+            else:
+                yaw_int = yaw_next
+
+            v_int = 0.5 * (v_prev + v_next) if v_mode == "mid" else v_next
+
+            x_new = x_prev + v_int * action_dt * torch.cos(yaw_int)
+            y_new = y_prev + v_int * action_dt * torch.sin(yaw_int)
+
+            corrected_norm[:, 0] = (x_new - mean_v[0, 0]) / std_v[0, 0]
+            corrected_norm[:, 1] = (y_new - mean_v[0, 1]) / std_v[0, 1]
+            yaw_prev = yaw_next
+            v_prev = v_next
+
+        emb_corr = encoder(corrected_norm.unsqueeze(1)).squeeze(1)
+        post_dist, _ = rssm.representation_model(emb_corr, d)
+        z = post_dist.mean
+
+        preds.append(corrected_norm)
+        z_seq.append(z)
+        d_seq.append(d)
+        x_prev = x_new
+        y_prev = y_new
+
     return (
         torch.stack(preds, dim=1),
         torch.stack(z_seq, dim=1),

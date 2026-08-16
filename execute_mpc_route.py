@@ -98,7 +98,12 @@ def main() -> None:
     p.add_argument("--goal-yaw-tol", type=float, default=0.8)
     p.add_argument("--max-seconds", type=float, default=240.0)
 
-    p.add_argument("--dynamics", choices=("analytical", "rssm"), default="analytical")
+    p.add_argument("--dynamics", choices=("analytical", "rssm", "hybrid"), default="analytical",
+                   help="analytical=unicycle only, rssm=fully learned, "
+                        "hybrid=exact position integration + learned yaw/vel/lidar")
+    p.add_argument("--hybrid-pose-mode", choices=("position", "full"), default="position",
+                   help="With --dynamics hybrid: 'position' splices only x,y using decoded "
+                        "yaw/v; 'full' overwrites all 5 pose dims from the command (A/B only).")
     p.add_argument("--cost", choices=("analytical", "learned", "blend"), default="analytical")
 
     p.add_argument("--obstacle-weight", type=float, default=0.0,
@@ -117,8 +122,8 @@ def main() -> None:
                    help="Execute one full CEM plan open-loop (baseline / A-B only).")
     args = p.parse_args()
 
-    if args.cost in ("learned", "blend") and args.dynamics != "rssm":
-        p.error("--cost learned/blend requires --dynamics rssm")
+    if args.cost in ("learned", "blend") and args.dynamics not in ("rssm", "hybrid"):
+        p.error("--cost learned/blend requires --dynamics rssm or hybrid")
 
     route = _parse_route(args.route_file)
     route_xy = route[:, :2]
@@ -224,6 +229,7 @@ def main() -> None:
                 discount=args.discount,
                 device=device, seed=args.seed,
                 dynamics=args.dynamics, cost=args.cost,
+                hybrid_pose_mode=args.hybrid_pose_mode,
                 action_dt=dt, reward_cfg=reward_cfg,
                 obstacle_weight=float(args.obstacle_weight),
                 obstacle_safety=float(args.safety_radius),
