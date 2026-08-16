@@ -37,7 +37,7 @@ os.environ.setdefault("GZ_CMD_VEL_USE_SUBPROCESS", "1")
 import torch  # noqa: E402
 
 import train_tugbot_world_model as wm  # noqa: E402
-from cardreamer_reward import RewardConfig  # noqa: E402
+from reward import RewardConfig  # noqa: E402
 from collect_transitions import (  # noqa: E402
     CMD_VEL_TOPIC,
     LidarReader,

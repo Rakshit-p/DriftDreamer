@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 import train_tugbot_world_model as wm
-from cardreamer_reward import (
+from reward import (
     RewardConfig,
     compute_reward,
     relative_goal,

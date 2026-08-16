@@ -45,7 +45,7 @@ parameters:
       activation: ELU
       min_std: 0.05
 
-    # Goal-conditioned reward head (see SimpleDreamer/cardreamer_reward.py).
+    # Goal-conditioned reward head (see SimpleDreamer/reward.py).
     # Input: posterior_z || deterministic_h || relative_goal(3,).  Output: scalar reward.
     reward_head:
       hidden_size: 128
