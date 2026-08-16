@@ -14,17 +14,42 @@ collection into ``transitions.npz`` (the first-iteration dataset format).
 
 import os
 import sys
+from pathlib import Path
 
-_gz_lib = "/opt/homebrew/lib"
-_existing_dyld = os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "")
-if _gz_lib not in _existing_dyld.split(":"):
-    os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = (
-        _gz_lib + (":" + _existing_dyld if _existing_dyld else "")
-    )
 
-_GZ_SITE = "/opt/homebrew/lib/python3.12/site-packages"
-if _GZ_SITE not in sys.path:
-    sys.path.insert(0, _GZ_SITE)
+def _bootstrap_gz_paths() -> None:
+    """Make the Gazebo Python bindings importable across setups.
+
+    Honours ``GZ_LIB_DIR`` / ``GZ_PYTHON_SITE`` env vars first (useful on
+    Linux or custom installs). On macOS it falls back to auto-detecting
+    the Homebrew prefix (``/opt/homebrew`` on Apple Silicon, ``/usr/local``
+    on Intel) and the running Python's ``X.Y`` version. Missing directories
+    are skipped silently instead of hard-coding one machine's layout.
+    """
+    lib_dir = os.environ.get("GZ_LIB_DIR")
+    site_dir = os.environ.get("GZ_PYTHON_SITE")
+
+    if not (lib_dir and site_dir) and sys.platform == "darwin":
+        for brew in ("/opt/homebrew", "/usr/local"):
+            if (Path(brew) / "lib").is_dir():
+                lib_dir = lib_dir or str(Path(brew) / "lib")
+                pyver = f"{sys.version_info.major}.{sys.version_info.minor}"
+                candidate = Path(brew) / "lib" / f"python{pyver}" / "site-packages"
+                if candidate.is_dir():
+                    site_dir = site_dir or str(candidate)
+                break
+
+    if lib_dir and Path(lib_dir).is_dir():
+        existing = os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "")
+        if lib_dir not in existing.split(":"):
+            os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = (
+                lib_dir + (":" + existing if existing else "")
+            )
+    if site_dir and Path(site_dir).is_dir() and site_dir not in sys.path:
+        sys.path.insert(0, site_dir)
+
+
+_bootstrap_gz_paths()
 
 os.environ.setdefault("GZ_IP", "127.0.0.1")
 os.environ.setdefault("GZ_DISCOVERY_LOCALHOST_ENABLED", "1")
@@ -74,7 +99,10 @@ def _env_float(name: str, default: float) -> float:
 
 NUM_TRANSITIONS = _env_int("NUM_TRANSITIONS", 3_000)
 ACTION_DURATION = _env_float("ACTION_DURATION", 0.3)
-SAVE_PATH = "/Users/rakshitpradhan/Desktop/factory/transitions.npz"
+SAVE_PATH = os.environ.get(
+    "SAVE_PATH",
+    str(Path(__file__).resolve().parent / "transitions.npz"),
+)
 
 WORLD_NAME = "world_demo"
 ROBOT_NAME = "tugbot"
@@ -541,7 +569,11 @@ def collect(reader: StateReader) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if _cmd_vel_pub is not False:
         print("cmd_vel : in-process gz.transport (no per-step subprocess)")
     else:
-        print("cmd_vel : subprocess `gz topic` (slower; use /opt/homebrew/bin/python3.12 for fast path)")
+        print(
+            "cmd_vel : subprocess `gz topic` (slower; set GZ_LIB_DIR + "
+            "GZ_PYTHON_SITE or use a Python built against gz.transport for "
+            "the in-process fast path)"
+        )
 
     _t_cmd = []
     for _ in range(3):

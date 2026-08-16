@@ -35,7 +35,7 @@ from dreamer.utils.utils import (
     horizontal_forward,
 )
 
-from cardreamer_reward import (
+from reward import (
     RewardConfig,
     compute_reward,
     relative_goal,
