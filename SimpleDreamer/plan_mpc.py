@@ -105,11 +105,30 @@ def rollout_and_score(
     goal_xyyaw: torch.Tensor,
     device: torch.device,
     discount: float = 0.97,
+    *,
+    hybrid: bool = False,
+    action_dt: float | None = None,
+    hybrid_pose_mode: str = "position",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Roll `actions` through the RSSM and score every rollout with the reward head."""
-    preds_norm, z_seq, d_seq = wm.imagine_with_latents(
-        rssm, encoder, decoder, s0_norm, actions, device
-    )
+    """Roll ``actions`` through the RSSM and score with the learned reward head.
+
+    With ``hybrid=True`` the exact unicycle position update is spliced into
+    every imagined step (see
+    :func:`train_tugbot_world_model.imagine_with_latents_hybrid`); this needs
+    ``action_dt``.
+    """
+    if hybrid:
+        if action_dt is None:
+            raise ValueError("hybrid=True requires action_dt")
+        preds_norm, z_seq, d_seq = wm.imagine_with_latents_hybrid(
+            rssm, encoder, decoder, s0_norm, actions, device,
+            mean=mean, std=std, action_dt=float(action_dt),
+            pose_mode=hybrid_pose_mode,
+        )
+    else:
+        preds_norm, z_seq, d_seq = wm.imagine_with_latents(
+            rssm, encoder, decoder, s0_norm, actions, device
+        )
     preds_world = preds_norm * std + mean
 
     K, H, _ = preds_world.shape
@@ -214,16 +233,19 @@ def plan_cem_mpc(
     obstacle_weight: float = 0.0,
     obstacle_safety: float = 0.6,
     obstacle_max_range: float = 5.0,
+    hybrid_pose_mode: str = "position",
 ) -> tuple[np.ndarray, dict]:
     """Run one CEM solve and return the first action plus diagnostics."""
     if reward_cfg is None:
         reward_cfg = RewardConfig()
-    if dynamics not in ("rssm", "analytical"):
-        raise ValueError(f"dynamics must be 'rssm' or 'analytical', got {dynamics!r}")
+    if dynamics not in ("rssm", "hybrid", "analytical"):
+        raise ValueError(f"dynamics must be 'rssm', 'hybrid' or 'analytical', got {dynamics!r}")
     if cost not in ("learned", "analytical", "blend"):
         raise ValueError(f"cost must be 'learned', 'analytical' or 'blend', got {cost!r}")
     if dynamics == "analytical" and cost != "analytical":
-        raise ValueError("cost='learned'/'blend' requires dynamics='rssm' (reward head needs RSSM latents).")
+        raise ValueError(
+            "cost='learned'/'blend' requires dynamics='rssm' or 'hybrid' (reward head needs RSSM latents)."
+        )
 
     g = torch.as_tensor(goal_xyyaw, dtype=torch.float32, device=device)
     s0_full = torch.as_tensor(s0_world, dtype=torch.float32, device=device).view(1, -1)
@@ -243,21 +265,24 @@ def plan_cem_mpc(
     last_preds = None
 
     s0_pose_batched = s0_pose.expand(samples, POSE_DIM).contiguous()
-    if dynamics == "rssm":
+    if dynamics in ("rssm", "hybrid"):
         s0_full_norm = (s0_full - mean) / std
         s0n = s0_full_norm.expand(samples, obs_dim).contiguous()
 
-    obs_has_rays = obs_dim > POSE_DIM and obstacle_weight > 0.0 and dynamics == "rssm"
+    obs_has_rays = obs_dim > POSE_DIM and obstacle_weight > 0.0 and dynamics in ("rssm", "hybrid")
 
     for _ in range(iters):
         eps = torch.randn(samples, horizon, 2, generator=rng, device=device, dtype=torch.float32)
         actions = mu.unsqueeze(0) + sig.unsqueeze(0) * eps
         actions = torch.max(torch.min(actions, hi), lo)
 
-        if dynamics == "rssm":
+        if dynamics in ("rssm", "hybrid"):
             rewards_learned, preds_world = rollout_and_score(
                 rssm, encoder, decoder, reward_head, mean, std, s0n, actions, g, device,
                 discount=discount,
+                hybrid=(dynamics == "hybrid"),
+                action_dt=action_dt,
+                hybrid_pose_mode=hybrid_pose_mode,
             )
         else:
             preds_world = diff_drive_rollout(s0_pose_batched, actions, action_dt)
