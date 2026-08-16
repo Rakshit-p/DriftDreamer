@@ -41,9 +41,9 @@ if str(_SD_DIR) not in sys.path:
     sys.path.insert(0, str(_SD_DIR))
 
 import train_tugbot_world_model as wm
+from obs_layout import ObsLayout
 
 
-POSE_DIM = 5
 SLICES = ("total", "pose", "pos", "yaw", "vel", "lidar")
 
 
@@ -79,20 +79,23 @@ def rollout(
     action_dt: float,
     yaw_mode: str = "mid",
     v_mode: str = "mid",
+    layout: ObsLayout | None = None,
 ) -> torch.Tensor:
     """Open-loop rollout in ``mode``; returns normalised ``(B, open_steps, D)``."""
+    layout = layout or ObsLayout()
+    pose_dim = layout.pose_dim
     latent, deterministic = _teacher_force(rssm, encoder, obs, act, teacher_steps, device)
 
     mean_v = mean.view(1, -1)
     std_v = std.view(1, -1)
-    mean_pose = mean_v[:, :POSE_DIM]
-    std_pose = std_v[:, :POSE_DIM]
+    mean_pose = mean_v[:, :pose_dim]
+    std_pose = std_v[:, :pose_dim]
 
     start_world = obs[:, teacher_steps] * std_v + mean_v
     x_prev = start_world[:, 0].clone()
     y_prev = start_world[:, 1].clone()
-    yaw_prev = start_world[:, 2].clone()
-    v_prev = start_world[:, 3].clone()
+    yaw_prev = layout.get_yaw(start_world).clone()
+    v_prev = layout.get_v(start_world).clone()
 
     preds: list[torch.Tensor] = []
     for t in range(teacher_steps + 1, teacher_steps + open_steps + 1):
@@ -115,14 +118,14 @@ def rollout(
             x_new = x_prev + v_cmd * action_dt * torch.cos(yaw_prev)
             y_new = y_prev + v_cmd * action_dt * torch.sin(yaw_prev)
             yaw_new = wm.wrap_pi(yaw_prev + w_cmd * action_dt)
-            pose_new = torch.stack([x_new, y_new, yaw_new, v_cmd, w_cmd], dim=-1)
-            corrected[:, :POSE_DIM] = (pose_new - mean_pose) / std_pose
+            pose_new = layout.build_pose(x_new, y_new, yaw_new, v_cmd, w_cmd)
+            corrected[:, :pose_dim] = (pose_new - mean_pose) / std_pose
             yaw_prev = yaw_new
             v_prev = v_cmd
         elif mode == "hybrid-pos":
             pred_world = pred_norm * std_v + mean_v
-            yaw_next = pred_world[:, 2]
-            v_next = pred_world[:, 3]
+            yaw_next = layout.get_yaw(pred_world)
+            v_next = layout.get_v(pred_world)
             if yaw_mode == "mid":
                 yaw_int = yaw_prev + 0.5 * wm.wrap_pi(yaw_next - yaw_prev)
             elif yaw_mode == "prev":
@@ -150,20 +153,24 @@ def rollout(
     return torch.stack(preds, dim=1)
 
 
-def split_mse(preds, targets, probe_ks) -> dict[str, float]:
+def split_mse(preds, targets, probe_ks, layout: ObsLayout | None = None) -> dict[str, float]:
     """Per-slice MSE at each probe horizon, averaged over the batch."""
+    layout = layout or ObsLayout()
+    pose_dim = layout.pose_dim
+    heading_cols = [2, 3] if layout.is_cossin else [2]
+    vel_cols = [layout.v_index, layout.w_index]
     err2 = (preds - targets) ** 2
     obs_dim = err2.shape[-1]
     out: dict[str, float] = {}
     for k in probe_ks:
         i = k - 1
         out[f"total_k{k}"] = float(err2[:, i].mean().cpu())
-        out[f"pose_k{k}"] = float(err2[:, i, :POSE_DIM].mean().cpu())
+        out[f"pose_k{k}"] = float(err2[:, i, :pose_dim].mean().cpu())
         out[f"pos_k{k}"] = float(err2[:, i, 0:2].mean().cpu())
-        out[f"yaw_k{k}"] = float(err2[:, i, 2:3].mean().cpu())
-        out[f"vel_k{k}"] = float(err2[:, i, 3:5].mean().cpu())
+        out[f"yaw_k{k}"] = float(err2[:, i][:, heading_cols].mean().cpu())
+        out[f"vel_k{k}"] = float(err2[:, i][:, vel_cols].mean().cpu())
         out[f"lidar_k{k}"] = (
-            float(err2[:, i, POSE_DIM:].mean().cpu()) if obs_dim > POSE_DIM else float("nan")
+            float(err2[:, i, pose_dim:].mean().cpu()) if obs_dim > pose_dim else float("nan")
         )
     return out
 
@@ -190,12 +197,15 @@ def main() -> None:
     args = parser.parse_args()
 
     device = wm.pick_device(args.device)
-    rssm, encoder, decoder, mean, std, _cfg = wm.load_world_model_bundle(args.checkpoint, device)
+    rssm, encoder, decoder, mean, std, _cfg, layout = wm.load_world_model_bundle(
+        args.checkpoint, device)
     obs_dim = int(mean.shape[-1])
+    pose_dim = layout.pose_dim
 
     print(f"device        : {device}")
     print(f"checkpoint    : {args.checkpoint.name}")
-    print(f"obs_dim       : {obs_dim}  (pose 0..{POSE_DIM - 1}, lidar {POSE_DIM}..{obs_dim - 1})")
+    print(f"obs_dim       : {obs_dim}  (pose 0..{pose_dim - 1}, lidar {pose_dim}..{obs_dim - 1})"
+          f"   layout: {layout.yaw_encoding}")
     print(f"action_dt     : {args.action_dt}   yaw_mode={args.yaw_mode}  v_mode={args.v_mode}")
 
     states, actions, next_states, episode_starts = wm.load_transition_dataset(args.dataset)
@@ -207,6 +217,7 @@ def main() -> None:
         states, actions, next_states, episode_starts, window
     )
 
+    obs_arr = layout.encode(obs_arr)
     m_np = mean.cpu().numpy().reshape(1, 1, -1)
     s_np = std.cpu().numpy().reshape(1, 1, -1)
     obs_arr = ((obs_arr - m_np) / s_np).astype(np.float32)
@@ -230,9 +241,9 @@ def main() -> None:
             rssm, encoder, decoder, obs_t, act_t,
             args.teacher_steps, args.open_steps, device, mode,
             mean=mean, std=std, action_dt=args.action_dt,
-            yaw_mode=args.yaw_mode, v_mode=args.v_mode,
+            yaw_mode=args.yaw_mode, v_mode=args.v_mode, layout=layout,
         )
-        results[mode] = split_mse(preds, targets, probe_ks)
+        results[mode] = split_mse(preds, targets, probe_ks, layout)
 
     khdr = " ".join(f"{f'k={k}':>10s}" for k in probe_ks)
     print("\nOpen-loop MSE, normalised units (lower is better)")

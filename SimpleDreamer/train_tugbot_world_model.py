@@ -36,6 +36,7 @@ from dreamer.utils.utils import (
     horizontal_forward,
 )
 
+from obs_layout import COSSIN, COSSIN_STD, RAW, ObsLayout, layout_from_checkpoint
 from reward import (
     RewardConfig,
     compute_reward,
@@ -87,17 +88,22 @@ class VectorDecoder(nn.Module):
 
 
 class GoalRewardHead(nn.Module):
-    """Reward predictor conditioned on RSSM latents + the goal in the robot's body frame."""
+    """Reward predictor conditioned on RSSM latents + the goal in the robot's body frame.
+
+    ``goal_dim`` follows the observation layout: 3 for a raw heading error,
+    4 when the heading error is encoded as ``(cos, sin)``.
+    """
 
     GOAL_DIM = 3
 
-    def __init__(self, config: AttrDict):
+    def __init__(self, config: AttrDict, goal_dim: int | None = None):
         super().__init__()
         p = config.parameters.dreamer.reward_head
         st = config.parameters.dreamer.stochastic_size
         det = config.parameters.dreamer.deterministic_size
+        self.goal_dim = int(goal_dim if goal_dim is not None else self.GOAL_DIM)
         self.network = build_network(
-            st + det + self.GOAL_DIM, p.hidden_size, p.num_layers, p.activation, 1)
+            st + det + self.goal_dim, p.hidden_size, p.num_layers, p.activation, 1)
 
     def forward(
         self,
@@ -205,11 +211,15 @@ def load_transition_dataset(
     )
 
 
-def normalize(obs: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    flat = obs.reshape(-1, obs.shape[-1])
-    mean = flat.mean(0, keepdims=True)
-    std = flat.std(0, keepdims=True) + 1e-6
-    return (obs - mean) / std, mean.astype(np.float32), std.astype(np.float32)
+def normalize(
+    obs: np.ndarray,
+    layout: ObsLayout | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Z-score observations, leaving any ``(cos, sin)`` heading pair on a
+    shared constant scale so the unit circle is not distorted."""
+    layout = layout or ObsLayout()
+    mean, std = layout.norm_stats(obs)
+    return (obs - mean) / std, mean, std
 
 
 def dynamic_losses(
@@ -225,8 +235,10 @@ def dynamic_losses(
     state_std: torch.Tensor | None = None,
     reward_cfg: RewardConfig | None = None,
     goal_rng: torch.Generator | None = None,
+    layout: ObsLayout | None = None,
 ) -> dict[str, torch.Tensor]:
     """Reconstruction + KL (+ open-loop recon + reward MSE when enabled)."""
+    layout = layout or ObsLayout()
     p = config.parameters.dreamer
     batch_length = p.batch_length
     bsz = obs.shape[0]
@@ -291,9 +303,9 @@ def dynamic_losses(
         with torch.no_grad():
             goal = sample_synthetic_goal(
                 s_world, radius_range=radius_range,
-                forward_bias=forward_bias, generator=goal_rng)
-            r_label = compute_reward(s_world, sp_world, goal, reward_cfg)
-            g_rel = relative_goal(sp_world, goal)
+                forward_bias=forward_bias, generator=goal_rng, layout=layout)
+            r_label = compute_reward(s_world, sp_world, goal, reward_cfg, layout=layout)
+            g_rel = relative_goal(sp_world, goal, layout=layout)
 
         post_t = post[:, 0]
         det_t = det[:, 0]
@@ -321,11 +333,12 @@ def train_step(
     state_std: torch.Tensor | None = None,
     reward_cfg: RewardConfig | None = None,
     goal_rng: torch.Generator | None = None,
+    layout: ObsLayout | None = None,
 ) -> dict[str, float]:
     metrics = dynamic_losses(
         rssm, encoder, decoder, obs, act, config, device,
         reward_head=reward_head, state_mean=state_mean, state_std=state_std,
-        reward_cfg=reward_cfg, goal_rng=goal_rng,
+        reward_cfg=reward_cfg, goal_rng=goal_rng, layout=layout,
     )
     p = config.parameters.dreamer
     optimizer.zero_grad()
@@ -352,11 +365,12 @@ def eval_recon(
     state_std: torch.Tensor | None = None,
     reward_cfg: RewardConfig | None = None,
     goal_rng: torch.Generator | None = None,
+    layout: ObsLayout | None = None,
 ) -> dict[str, float]:
     metrics = dynamic_losses(
         rssm, encoder, decoder, obs, act, config, device,
         reward_head=reward_head, state_mean=state_mean, state_std=state_std,
-        reward_cfg=reward_cfg, goal_rng=goal_rng,
+        reward_cfg=reward_cfg, goal_rng=goal_rng, layout=layout,
     )
     return {k: float(v.cpu()) for k, v in metrics.items()}
 
@@ -372,15 +386,15 @@ def eval_multistep_imagination(
     teacher_steps: int = 1,
     open_steps: int = 12,
     probe_ks: tuple[int, ...] = (1, 4, 12),
-    pose_dim: int = 5,
+    layout: ObsLayout | None = None,
 ) -> dict[str, float]:
     """Measure prior-rollout reconstruction MSE at each ``probe_ks`` step.
 
     Besides the total MSE over all dims, this also reports the MSE
-    restricted to the pose block (first ``pose_dim`` dims) and to the lidar
-    block (the rest), so pose drift can be tracked separately from lidar
-    prediction quality.
+    restricted to the pose block and to the lidar block, so pose drift can
+    be tracked separately from lidar prediction quality.
     """
+    pose_dim = (layout or ObsLayout()).pose_dim
     T = obs.shape[1]
     if T < teacher_steps + open_steps + 1:
         return {}
@@ -451,8 +465,12 @@ def resolve_config_path(stored: str | Path) -> Path:
 def load_world_model_bundle(
     checkpoint_path: Path,
     device: torch.device,
-) -> tuple[RSSM, MLPEncoder, VectorDecoder, torch.Tensor, torch.Tensor, AttrDict]:
-    """Load (encoder, rssm, decoder, mean, std, config) from a checkpoint."""
+) -> tuple[RSSM, MLPEncoder, VectorDecoder, torch.Tensor, torch.Tensor, AttrDict, ObsLayout]:
+    """Load (rssm, encoder, decoder, mean, std, config, layout) from a checkpoint.
+
+    ``layout`` records how the checkpoint encodes heading; checkpoints
+    written before that distinction existed are treated as ``raw``.
+    """
     try:
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     except TypeError:
@@ -462,6 +480,7 @@ def load_world_model_bundle(
     config["operation"]["device"] = str(device)
     obs_dim = int(ckpt["obs_dim"])
     action_dim = int(ckpt["action_dim"])
+    layout = layout_from_checkpoint(ckpt)
     mean = torch.as_tensor(np.asarray(ckpt["mean"]), dtype=torch.float32, device=device)
     std = torch.as_tensor(np.asarray(ckpt["std"]), dtype=torch.float32, device=device)
     rssm = RSSM(action_dim, config).to(device)
@@ -473,15 +492,16 @@ def load_world_model_bundle(
     rssm.eval()
     encoder.eval()
     decoder.eval()
-    return rssm, encoder, decoder, mean, std, config
+    return rssm, encoder, decoder, mean, std, config, layout
 
 
 def load_world_model_with_reward(
     checkpoint_path: Path,
     device: torch.device,
-) -> tuple[RSSM, MLPEncoder, VectorDecoder, GoalRewardHead, torch.Tensor, torch.Tensor, AttrDict]:
+) -> tuple[RSSM, MLPEncoder, VectorDecoder, GoalRewardHead, torch.Tensor, torch.Tensor, AttrDict, ObsLayout]:
     """Load everything plus a GoalRewardHead; raises KeyError if the head is missing."""
-    rssm, encoder, decoder, mean, std, config = load_world_model_bundle(checkpoint_path, device)
+    rssm, encoder, decoder, mean, std, config, layout = load_world_model_bundle(
+        checkpoint_path, device)
     try:
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     except TypeError:
@@ -489,10 +509,10 @@ def load_world_model_with_reward(
     if "reward_head" not in ckpt:
         raise KeyError(
             f"Checkpoint {checkpoint_path} has no 'reward_head' — retrain with --train-reward-head.")
-    head = GoalRewardHead(config).to(device)
+    head = GoalRewardHead(config, goal_dim=layout.rel_goal_dim).to(device)
     head.load_state_dict(ckpt["reward_head"])
     head.eval()
-    return rssm, encoder, decoder, head, mean, std, config
+    return rssm, encoder, decoder, head, mean, std, config, layout
 
 
 @torch.no_grad()
@@ -559,7 +579,7 @@ def imagine_with_latents_hybrid(
     pose_mode: str = "position",
     yaw_mode: str = "mid",
     v_mode: str = "mid",
-    pose_dim: int = 5,
+    layout: ObsLayout | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Hybrid RSSM + exact-kinematics rollout (physics-grounded position).
 
@@ -593,6 +613,8 @@ def imagine_with_latents_hybrid(
     if v_mode not in ("mid", "next"):
         raise ValueError(f"v_mode must be 'mid' or 'next', got {v_mode!r}")
 
+    layout = layout or ObsLayout()
+    pose_dim = layout.pose_dim
     K, H, _ = actions.shape
     obs_dim = s0_norm.shape[-1]
     if obs_dim < pose_dim:
@@ -611,8 +633,8 @@ def imagine_with_latents_hybrid(
     s0_world = s0_norm * std_v + mean_v
     x_prev = s0_world[:, 0].clone()
     y_prev = s0_world[:, 1].clone()
-    yaw_prev = s0_world[:, 2].clone()
-    v_prev = s0_world[:, 3].clone()
+    yaw_prev = layout.get_yaw(s0_world).clone()
+    v_prev = layout.get_v(s0_world).clone()
 
     obs_in = s0_norm.view(K, 1, obs_dim)
     emb = encoder(obs_in)
@@ -642,14 +664,14 @@ def imagine_with_latents_hybrid(
             x_new = x_prev + v_cmd * action_dt * torch.cos(yaw_prev)
             y_new = y_prev + v_cmd * action_dt * torch.sin(yaw_prev)
             yaw_new = wrap_pi(yaw_prev + w_cmd * action_dt)
-            pose_new = torch.stack([x_new, y_new, yaw_new, v_cmd, w_cmd], dim=-1)
+            pose_new = layout.build_pose(x_new, y_new, yaw_new, v_cmd, w_cmd)
             corrected_norm[:, :pose_dim] = (pose_new - mean_pose) / std_pose
             yaw_prev = yaw_new
             v_prev = v_cmd
         else:
             pred_world = pred_norm * std_v + mean_v
-            yaw_next = pred_world[:, 2]
-            v_next = pred_world[:, 3]
+            yaw_next = layout.get_yaw(pred_world)
+            v_next = layout.get_v(pred_world)
 
             if yaw_mode == "mid":
                 yaw_int = yaw_prev + 0.5 * wrap_pi(yaw_next - yaw_prev)
@@ -719,6 +741,10 @@ def main() -> None:
     parser.add_argument("--freeze-dynamics", action="store_true",
                         help="Freeze encoder/rssm/decoder and train only the reward head "
                              "(requires --train-reward-head and --warm-start).")
+    parser.add_argument("--yaw-encoding", choices=(RAW, COSSIN), default=RAW,
+                        help="How heading enters the observation. 'raw' keeps the angle and has "
+                             "a discontinuity at +-pi that MSE cannot fit; 'cossin' expands it "
+                             "to (cos, sin), widening obs_dim by one.")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -776,7 +802,15 @@ def main() -> None:
     if len(tr_idx) < 2:
         raise RuntimeError("Not enough training rows after split.")
 
-    obs_tr, mean, std = normalize(obs[tr_idx])
+    layout = ObsLayout(args.yaw_encoding)
+    if layout.is_cossin:
+        obs = layout.encode(obs)
+        print(f"[layout] heading encoded as (cos, sin): obs_dim {obs.shape[-1] - 1} -> "
+              f"{obs.shape[-1]}; the pair shares std={COSSIN_STD:.4f} and is not z-scored")
+    else:
+        print("[layout] heading kept as a raw angle (has a discontinuity at +-pi)")
+
+    obs_tr, mean, std = normalize(obs[tr_idx], layout)
     obs_val = (obs[val_idx] - mean) / std
 
     obs_dim = obs_tr.shape[-1]
@@ -788,7 +822,7 @@ def main() -> None:
 
     reward_head: GoalRewardHead | None = None
     if args.train_reward_head:
-        reward_head = GoalRewardHead(config).to(device)
+        reward_head = GoalRewardHead(config, goal_dim=layout.rel_goal_dim).to(device)
 
     if args.warm_start is not None:
         if not args.warm_start.is_file():
@@ -797,6 +831,13 @@ def main() -> None:
             ws = torch.load(args.warm_start, map_location=device, weights_only=False)
         except TypeError:
             ws = torch.load(args.warm_start, map_location=device)
+        ws_layout = layout_from_checkpoint(ws)
+        if ws_layout.yaw_encoding != layout.yaw_encoding:
+            raise SystemExit(
+                f"--warm-start checkpoint uses yaw_encoding={ws_layout.yaw_encoding!r} but this "
+                f"run uses {layout.yaw_encoding!r}; the observation widths differ so the weights "
+                f"are incompatible. Retrain from scratch or match the encoding."
+            )
         encoder.load_state_dict(ws["encoder"])
         rssm.load_state_dict(ws["rssm"])
         decoder.load_state_dict(ws["decoder"])
@@ -866,6 +907,7 @@ def main() -> None:
             "mean": mean,
             "std": std,
             "config_path": str(args.config),
+            "yaw_encoding": layout.yaw_encoding,
         }
         if reward_head is not None:
             payload["reward_head"] = reward_head.state_dict()
@@ -881,7 +923,7 @@ def main() -> None:
             rssm, encoder, decoder, obs_tr_t[idx], act_tr_t[idx], config, optimizer, device,
             reward_head=reward_head,
             state_mean=mean_t, state_std=std_t,
-            reward_cfg=reward_cfg, goal_rng=goal_rng,
+            reward_cfg=reward_cfg, goal_rng=goal_rng, layout=layout,
         )
 
         if writer is not None and (step % log_every == 0 or step == 1):
@@ -912,7 +954,7 @@ def main() -> None:
                         rssm, encoder, decoder, obs_val_t[vidx], act_val_t[vidx], config, device,
                         reward_head=reward_head,
                         state_mean=mean_t, state_std=std_t,
-                        reward_cfg=reward_cfg, goal_rng=goal_rng,
+                        reward_cfg=reward_cfg, goal_rng=goal_rng, layout=layout,
                     )
 
             multistep_metrics: dict[str, float] = {}
@@ -928,6 +970,7 @@ def main() -> None:
                             rssm, encoder, decoder, obs_ms, act_ms, device,
                             teacher_steps=1, open_steps=open_steps,
                             probe_ks=(1, 4, min(12, open_steps)),
+                            layout=layout,
                         )
 
             if not args.freeze_dynamics:

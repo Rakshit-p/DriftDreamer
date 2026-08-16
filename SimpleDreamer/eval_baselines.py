@@ -48,31 +48,7 @@ if str(_SD_DIR) not in sys.path:
     sys.path.insert(0, str(_SD_DIR))
 
 import train_tugbot_world_model as wm
-
-
-def build_slices(obs_dim: int, yaw_dim: int | None) -> dict[str, list[int]]:
-    """Map slice name -> observation column indices."""
-    sl: dict[str, list[int]] = {}
-    if yaw_dim is None:
-        sl["x"] = [0]
-        sl["y"] = [1]
-        sl["cos_yaw"] = [2]
-        sl["sin_yaw"] = [3]
-        sl["v"] = [4]
-        sl["w"] = [5]
-        pose_end = 6
-    else:
-        sl["x"] = [0]
-        sl["y"] = [1]
-        sl["yaw"] = [2]
-        sl["v"] = [3]
-        sl["w"] = [4]
-        pose_end = 5
-    sl["pose(all)"] = list(range(pose_end))
-    if obs_dim > pose_end:
-        sl["lidar(all)"] = list(range(pose_end, obs_dim))
-    sl["ALL"] = list(range(obs_dim))
-    return sl
+from obs_layout import ObsLayout
 
 
 @torch.no_grad()
@@ -157,19 +133,18 @@ def main() -> None:
                     help="Keep only windows whose |yaw| stays below --interior-thresh "
                          "for the whole window (tests the wrap-discontinuity hypothesis).")
     ap.add_argument("--interior-thresh", type=float, default=2.5)
-    ap.add_argument("--yaw-is-cos-sin", action="store_true",
-                    help="Set when the checkpoint was trained with (cos, sin) yaw encoding.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", type=str, default=None)
     args = ap.parse_args()
 
     device = wm.pick_device(args.device)
-    rssm, encoder, decoder, mean, std, _cfg = wm.load_world_model_bundle(args.checkpoint, device)
+    rssm, encoder, decoder, mean, std, _cfg, layout = wm.load_world_model_bundle(
+        args.checkpoint, device)
     obs_dim = int(mean.view(-1).shape[0])
-    yaw_dim = None if args.yaw_is_cos_sin else 2
+    yaw_dim = None if layout.is_cossin else 2
 
     print(f"checkpoint    : {args.checkpoint.name}")
-    print(f"device        : {device}    obs_dim: {obs_dim}")
+    print(f"device        : {device}    obs_dim: {obs_dim}    layout: {layout.yaw_encoding}")
 
     states, actions, next_states, eps = wm.load_transition_dataset(args.dataset)
     if eps is None:
@@ -179,9 +154,7 @@ def main() -> None:
     total_windows = obs_w.shape[0]
 
     if args.interior_only:
-        if yaw_dim is None:
-            raise SystemExit("--interior-only is meaningless with (cos, sin) yaw")
-        keep = np.all(np.abs(obs_w[:, :, yaw_dim]) < args.interior_thresh, axis=1)
+        keep = np.all(np.abs(obs_w[:, :, 2]) < args.interior_thresh, axis=1)
         obs_w, act_w = obs_w[keep], act_w[keep]
         print(f"windows       : {obs_w.shape[0]} of {total_windows} kept "
               f"(|yaw| < {args.interior_thresh} throughout)")
@@ -190,6 +163,7 @@ def main() -> None:
     else:
         print(f"windows       : {total_windows} (no filtering)")
 
+    obs_w = layout.encode(obs_w)
     m_np = mean.cpu().numpy().reshape(1, 1, -1)
     s_np = std.cpu().numpy().reshape(1, 1, -1)
     obs_n = ((obs_w - m_np) / s_np).astype(np.float32)
@@ -201,7 +175,7 @@ def main() -> None:
     act_t = torch.from_numpy(act_w[idx].astype(np.float32)).to(device)
     print(f"sampled       : {bsz}")
 
-    slices = build_slices(obs_dim, yaw_dim)
+    slices = layout.slice_map(obs_dim)
 
     recon = zero_step_recon(rssm, encoder, decoder, obs_t, act_t, device)
     recon_tgt = obs_t[:, 1:]
@@ -226,30 +200,40 @@ def main() -> None:
         v_ol[k] = report_table(f"open-loop k={k} MSE (normalised)",
                                slices, pred_k, tgt_k, frozen_k)
 
-    if yaw_dim is not None:
-        sv = float(std.view(-1)[yaw_dim])
-        mv = float(mean.view(-1)[yaw_dim])
+    mean_v = mean.view(1, -1)
+    std_v = std.view(1, -1)
 
-        def ang_err_deg(pred_n, tgt_n):
-            pw = pred_n * sv + mv
-            tw = tgt_n * sv + mv
-            return float(torch.sqrt((wm.wrap_pi(pw - tw) ** 2).mean()).cpu()) * 180.0 / math.pi
+    def ang_err_deg(pred_n: torch.Tensor, tgt_n: torch.Tensor) -> float:
+        """RMS heading error in degrees, comparing whole observation vectors.
 
-        print("\n" + "=" * 78)
-        print("YAW, wrap-aware (RMS angular error in degrees)")
-        print("=" * 78)
-        print(f"  {'probe':<16s}{'model':>10s}{'pred-mean':>11s}{'frozen':>10s}")
-        r_t = recon_tgt[..., yaw_dim]
-        print(f"  {'recon(0-step)':<16s}"
-              f"{ang_err_deg(recon[..., yaw_dim], r_t):>10.1f}"
-              f"{ang_err_deg(torch.zeros_like(r_t), r_t):>11.1f}"
-              f"{ang_err_deg(recon_frozen[..., yaw_dim], r_t):>10.1f}")
-        for k in ks:
-            t_k = obs_t[:, args.teacher_steps + k, yaw_dim]
-            print(f"  {'open-loop k=' + str(k):<16s}"
-                  f"{ang_err_deg(ol[:, k - 1, yaw_dim], t_k):>10.1f}"
-                  f"{ang_err_deg(torch.zeros_like(t_k), t_k):>11.1f}"
-                  f"{ang_err_deg(obs_t[:, args.teacher_steps, yaw_dim], t_k):>10.1f}")
+        Denormalises first and recovers the angle through the layout, so the
+        number is directly comparable between the raw and (cos, sin)
+        encodings even though they occupy different columns.
+        """
+        shp = pred_n.shape[:-1]
+        pw = pred_n.reshape(-1, pred_n.shape[-1]) * std_v + mean_v
+        tw = tgt_n.reshape(-1, tgt_n.shape[-1]) * std_v + mean_v
+        err = wm.wrap_pi(layout.get_yaw(pw) - layout.get_yaw(tw)).reshape(shp)
+        return float(torch.sqrt((err ** 2).mean()).cpu()) * 180.0 / math.pi
+
+    print("\n" + "=" * 78)
+    print("HEADING, wrap-aware (RMS angular error in degrees)")
+    print("  Comparable across yaw encodings; 'pred-mean' emits the dataset mean pose.")
+    print("=" * 78)
+    print(f"  {'probe':<16s}{'model':>10s}{'pred-mean':>11s}{'frozen':>10s}")
+    zeros_r = torch.zeros_like(recon_tgt)
+    print(f"  {'recon(0-step)':<16s}"
+          f"{ang_err_deg(recon, recon_tgt):>10.1f}"
+          f"{ang_err_deg(zeros_r, recon_tgt):>11.1f}"
+          f"{ang_err_deg(recon_frozen, recon_tgt):>10.1f}")
+    for k in ks:
+        t_k = obs_t[:, args.teacher_steps + k].unsqueeze(1)
+        p_k = ol[:, k - 1].unsqueeze(1)
+        f_k = obs_t[:, args.teacher_steps].unsqueeze(1)
+        print(f"  {'open-loop k=' + str(k):<16s}"
+              f"{ang_err_deg(p_k, t_k):>10.1f}"
+              f"{ang_err_deg(torch.zeros_like(t_k), t_k):>11.1f}"
+              f"{ang_err_deg(f_k, t_k):>10.1f}")
 
     print("\n" + "=" * 78)
     print("SUMMARY: slices with no learned signal (lose to a trivial baseline)")

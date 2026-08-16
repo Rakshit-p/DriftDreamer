@@ -14,6 +14,8 @@ from dataclasses import dataclass
 
 import torch
 
+from obs_layout import ObsLayout
+
 
 @dataclass(frozen=True)
 class RewardConfig:
@@ -37,9 +39,22 @@ def _wrap_pi(a: torch.Tensor) -> torch.Tensor:
     return (a + math.pi) % (2.0 * math.pi) - math.pi
 
 
-def relative_goal(state: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
-    """Return (dx_ego, dy_ego, dyaw) — the goal in the robot's body frame."""
-    sx, sy, syaw = state[..., 0], state[..., 1], state[..., 2]
+def relative_goal(
+    state: torch.Tensor,
+    goal: torch.Tensor,
+    layout: ObsLayout | None = None,
+) -> torch.Tensor:
+    """Return the goal expressed in the robot's body frame.
+
+    With a ``raw`` layout this is ``(dx_ego, dy_ego, dyaw)``. With a
+    ``cossin`` layout the heading error is emitted as
+    ``(dx_ego, dy_ego, cos dyaw, sin dyaw)`` so the reward head sees a
+    continuous encoding rather than a value that jumps across the +-pi
+    seam -- the same reason the observation encodes heading that way.
+    """
+    layout = layout or ObsLayout()
+    sx, sy = state[..., 0], state[..., 1]
+    syaw = layout.get_yaw(state)
     gx, gy, gyaw = goal[..., 0], goal[..., 1], goal[..., 2]
     c, s = torch.cos(syaw), torch.sin(syaw)
     dx = gx - sx
@@ -47,6 +62,8 @@ def relative_goal(state: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
     dxe = c * dx + s * dy
     dye = -s * dx + c * dy
     dyaw = _wrap_pi(gyaw - syaw)
+    if layout.is_cossin:
+        return torch.stack([dxe, dye, torch.cos(dyaw), torch.sin(dyaw)], dim=-1)
     return torch.stack([dxe, dye, dyaw], dim=-1)
 
 
@@ -55,10 +72,13 @@ def compute_reward(
     next_state: torch.Tensor,
     goal: torch.Tensor,
     cfg: RewardConfig = RewardConfig(),
+    layout: ObsLayout | None = None,
 ) -> torch.Tensor:
     """Scalar reward for a single (state, next_state, goal) transition."""
-    nx, ny, nyaw = next_state[..., 0], next_state[..., 1], next_state[..., 2]
-    v_lin = next_state[..., 3]
+    layout = layout or ObsLayout()
+    nx, ny = next_state[..., 0], next_state[..., 1]
+    nyaw = layout.get_yaw(next_state)
+    v_lin = layout.get_v(next_state)
 
     gx, gy, gyaw = goal[..., 0], goal[..., 1], goal[..., 2]
     tx, ty = torch.cos(gyaw), torch.sin(gyaw)
@@ -93,10 +113,13 @@ def compute_reward_terms(
     next_state: torch.Tensor,
     goal: torch.Tensor,
     cfg: RewardConfig = RewardConfig(),
+    layout: ObsLayout | None = None,
 ) -> dict[str, torch.Tensor]:
     """Same formula as ``compute_reward`` but returns every term for logging."""
-    nx, ny, nyaw = next_state[..., 0], next_state[..., 1], next_state[..., 2]
-    v_lin = next_state[..., 3]
+    layout = layout or ObsLayout()
+    nx, ny = next_state[..., 0], next_state[..., 1]
+    nyaw = layout.get_yaw(next_state)
+    v_lin = layout.get_v(next_state)
     gx, gy, gyaw = goal[..., 0], goal[..., 1], goal[..., 2]
     tx, ty = torch.cos(gyaw), torch.sin(gyaw)
     ox, oy = gx - nx, gy - ny
@@ -142,6 +165,7 @@ def sample_synthetic_goal(
     goal_tol: float = 0.25,
     r_reach: float = 0.35,
     generator: torch.Generator | None = None,
+    layout: ObsLayout | None = None,
 ) -> torch.Tensor:
     """Sample a random (gx, gy, gyaw) per state for reward-head training.
 
@@ -155,6 +179,7 @@ def sample_synthetic_goal(
         with a ``forward_bias`` chance of being forced ahead of the robot
         (the on-route regime the planner actually sees at runtime).
     """
+    layout = layout or ObsLayout()
     device = states.device
     dtype = states.dtype
     shape = states.shape[:-1]
@@ -165,7 +190,7 @@ def sample_synthetic_goal(
     r_far = _rand(*shape) * (radius_range[1] - radius_range[0]) + radius_range[0]
     theta = _rand(*shape) * (2.0 * math.pi) - math.pi
     bias_mask = _rand(*shape) < forward_bias
-    syaw = states[..., 2]
+    syaw = layout.get_yaw(states)
     forward_theta = syaw + (_rand(*shape) - 0.5) * math.pi
     theta = torch.where(bias_mask, forward_theta, theta)
 

@@ -20,6 +20,7 @@ import numpy as np
 import torch
 
 import train_tugbot_world_model as wm
+from obs_layout import ObsLayout
 from reward import (
     RewardConfig,
     compute_reward,
@@ -39,25 +40,23 @@ def diff_drive_rollout(
     s0_world: torch.Tensor,
     actions: torch.Tensor,
     dt: float,
+    layout: ObsLayout | None = None,
 ) -> torch.Tensor:
-    """Unicycle kinematic rollout; `(K, 5)` start → `(K, H, 5)` future poses."""
+    """Unicycle kinematic rollout; ``(K, pose_dim)`` start → ``(K, H, pose_dim)``."""
+    layout = layout or ObsLayout()
     K, H, _ = actions.shape
     x = s0_world[:, 0].clone()
     y = s0_world[:, 1].clone()
-    yaw = s0_world[:, 2].clone()
-    out = torch.zeros(K, H, POSE_DIM, device=actions.device, dtype=actions.dtype)
+    yaw = layout.get_yaw(s0_world).clone()
+    outs: list[torch.Tensor] = []
     for t in range(H):
         v = actions[:, t, 0]
         w = actions[:, t, 1]
         x = x + v * dt * torch.cos(yaw)
         y = y + v * dt * torch.sin(yaw)
         yaw = _wrap_pi(yaw + w * dt)
-        out[:, t, 0] = x
-        out[:, t, 1] = y
-        out[:, t, 2] = yaw
-        out[:, t, 3] = v
-        out[:, t, 4] = w
-    return out
+        outs.append(layout.build_pose(x, y, yaw, v, w))
+    return torch.stack(outs, dim=1)
 
 
 @dataclass
@@ -109,6 +108,7 @@ def rollout_and_score(
     hybrid: bool = False,
     action_dt: float | None = None,
     hybrid_pose_mode: str = "position",
+    layout: ObsLayout | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Roll ``actions`` through the RSSM and score with the learned reward head.
 
@@ -117,13 +117,14 @@ def rollout_and_score(
     :func:`train_tugbot_world_model.imagine_with_latents_hybrid`); this needs
     ``action_dt``.
     """
+    layout = layout or ObsLayout()
     if hybrid:
         if action_dt is None:
             raise ValueError("hybrid=True requires action_dt")
         preds_norm, z_seq, d_seq = wm.imagine_with_latents_hybrid(
             rssm, encoder, decoder, s0_norm, actions, device,
             mean=mean, std=std, action_dt=float(action_dt),
-            pose_mode=hybrid_pose_mode,
+            pose_mode=hybrid_pose_mode, layout=layout,
         )
     else:
         preds_norm, z_seq, d_seq = wm.imagine_with_latents(
@@ -132,9 +133,9 @@ def rollout_and_score(
     preds_world = preds_norm * std + mean
 
     K, H, _ = preds_world.shape
-    pose_preds = preds_world[..., :POSE_DIM]
+    pose_preds = preds_world[..., :layout.pose_dim]
     g_full = goal_xyyaw.view(1, 1, 3).expand(K, H, 3)
-    g_rel = relative_goal(pose_preds, g_full)
+    g_rel = relative_goal(pose_preds, g_full, layout=layout)
 
     r_pred = reward_head(z_seq, d_seq, g_rel)
 
@@ -157,18 +158,21 @@ def score_analytical(
     goal_xyyaw: torch.Tensor,
     reward_cfg: RewardConfig,
     discount: float = 0.97,
+    layout: ObsLayout | None = None,
 ) -> torch.Tensor:
     """Score rollouts with the CarDreamer reward formula on the decoded pose."""
-    pose_preds = preds_world[..., :POSE_DIM]
-    pose_s0 = s0_world[..., :POSE_DIM]
+    layout = layout or ObsLayout()
+    pose_dim = layout.pose_dim
+    pose_preds = preds_world[..., :pose_dim]
+    pose_s0 = s0_world[..., :pose_dim]
 
     K, H, _ = pose_preds.shape
     g_full = goal_xyyaw.view(1, 1, 3).expand(K, H, 3)
     prev = torch.cat(
-        [pose_s0.view(1, 1, POSE_DIM).expand(K, 1, POSE_DIM), pose_preds[:, :-1]],
+        [pose_s0.view(1, 1, pose_dim).expand(K, 1, pose_dim), pose_preds[:, :-1]],
         dim=1,
     )
-    r = compute_reward(prev, pose_preds, g_full, reward_cfg)
+    r = compute_reward(prev, pose_preds, g_full, reward_cfg, layout=layout)
     if discount == 1.0:
         return r.sum(dim=1)
     gammas = torch.pow(
@@ -185,12 +189,14 @@ def score_obstacle_penalty(
     safety_radius: float = 0.6,
     max_range: float = 5.0,
     discount: float = 0.97,
+    layout: ObsLayout | None = None,
 ) -> torch.Tensor | None:
     """Squared-hinge penalty on decoded lidar rays that fall inside the safety radius."""
+    pose_dim = (layout or ObsLayout()).pose_dim
     obs_dim = preds_world.shape[-1]
-    if obs_dim <= POSE_DIM:
+    if obs_dim <= pose_dim:
         return None
-    rays_norm = preds_world[..., POSE_DIM:].clamp(0.0, 1.0)
+    rays_norm = preds_world[..., pose_dim:].clamp(0.0, 1.0)
     rays_m = rays_norm * max_range
     violation = torch.clamp(safety_radius - rays_m, min=0.0)
     per_step_pen = (violation * violation).sum(dim=-1)
@@ -234,8 +240,11 @@ def plan_cem_mpc(
     obstacle_safety: float = 0.6,
     obstacle_max_range: float = 5.0,
     hybrid_pose_mode: str = "position",
+    layout: ObsLayout | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Run one CEM solve and return the first action plus diagnostics."""
+    layout = layout or ObsLayout()
+    pose_dim = layout.pose_dim
     if reward_cfg is None:
         reward_cfg = RewardConfig()
     if dynamics not in ("rssm", "hybrid", "analytical"):
@@ -250,9 +259,9 @@ def plan_cem_mpc(
     g = torch.as_tensor(goal_xyyaw, dtype=torch.float32, device=device)
     s0_full = torch.as_tensor(s0_world, dtype=torch.float32, device=device).view(1, -1)
     obs_dim = s0_full.shape[-1]
-    if obs_dim < POSE_DIM:
-        raise ValueError(f"s0_world must have at least {POSE_DIM} columns, got {obs_dim}.")
-    s0_pose = s0_full[:, :POSE_DIM]
+    if obs_dim < pose_dim:
+        raise ValueError(f"s0_world must have at least {pose_dim} columns, got {obs_dim}.")
+    s0_pose = s0_full[:, :pose_dim]
 
     rng = _make_generator(device, seed + state._plan_idx)
     lo = torch.tensor([lin_range[0], ang_range[0]], device=device, dtype=torch.float32)
@@ -264,12 +273,12 @@ def plan_cem_mpc(
     best_r = -float("inf")
     last_preds = None
 
-    s0_pose_batched = s0_pose.expand(samples, POSE_DIM).contiguous()
+    s0_pose_batched = s0_pose.expand(samples, pose_dim).contiguous()
     if dynamics in ("rssm", "hybrid"):
         s0_full_norm = (s0_full - mean) / std
         s0n = s0_full_norm.expand(samples, obs_dim).contiguous()
 
-    obs_has_rays = obs_dim > POSE_DIM and obstacle_weight > 0.0 and dynamics in ("rssm", "hybrid")
+    obs_has_rays = obs_dim > pose_dim and obstacle_weight > 0.0 and dynamics in ("rssm", "hybrid")
 
     for _ in range(iters):
         eps = torch.randn(samples, horizon, 2, generator=rng, device=device, dtype=torch.float32)
@@ -283,17 +292,20 @@ def plan_cem_mpc(
                 hybrid=(dynamics == "hybrid"),
                 action_dt=action_dt,
                 hybrid_pose_mode=hybrid_pose_mode,
+                layout=layout,
             )
         else:
-            preds_world = diff_drive_rollout(s0_pose_batched, actions, action_dt)
+            preds_world = diff_drive_rollout(s0_pose_batched, actions, action_dt, layout)
             rewards_learned = None
 
         if cost == "learned":
             scores = rewards_learned
         elif cost == "analytical":
-            scores = score_analytical(preds_world, s0_pose.squeeze(0), actions, g, reward_cfg, discount)
+            scores = score_analytical(preds_world, s0_pose.squeeze(0), actions, g,
+                                      reward_cfg, discount, layout=layout)
         else:
-            ra = score_analytical(preds_world, s0_pose.squeeze(0), actions, g, reward_cfg, discount)
+            ra = score_analytical(preds_world, s0_pose.squeeze(0), actions, g,
+                                  reward_cfg, discount, layout=layout)
             scores = 0.5 * rewards_learned + 0.5 * ra
 
         if obs_has_rays:
@@ -302,6 +314,7 @@ def plan_cem_mpc(
                 safety_radius=obstacle_safety,
                 max_range=obstacle_max_range,
                 discount=discount,
+                layout=layout,
             )
             if obs_pen is not None:
                 scores = scores + obstacle_weight * obs_pen

@@ -47,6 +47,7 @@ from collect_transitions import (  # noqa: E402
     send_cmd_vel,
     unpause_sim,
 )
+from obs_layout import ObsLayout  # noqa: E402
 from plan_mpc import POSE_DIM, MPCState, plan_cem_mpc  # noqa: E402
 from run_route import _parse_route, _wrap_pi  # noqa: E402
 
@@ -135,25 +136,30 @@ def main() -> None:
     device = _pick_device(args.device)
     print(f"device={device}  dynamics={args.dynamics}  cost={args.cost}", flush=True)
 
-    if args.cost in ("learned", "blend") or args.dynamics == "rssm":
-        rssm, enc, dec, head, mean, std, _cfg = wm.load_world_model_with_reward(
+    if args.cost in ("learned", "blend") or args.dynamics in ("rssm", "hybrid"):
+        rssm, enc, dec, head, mean, std, _cfg, layout = wm.load_world_model_with_reward(
             args.checkpoint, device)
     else:
         try:
-            rssm, enc, dec, head, mean, std, _cfg = wm.load_world_model_with_reward(
+            rssm, enc, dec, head, mean, std, _cfg, layout = wm.load_world_model_with_reward(
                 args.checkpoint, device)
         except (KeyError, FileNotFoundError):
             rssm = enc = dec = head = None
-            mean = torch.zeros(POSE_DIM, device=device)
-            std = torch.ones(POSE_DIM, device=device)
+            layout = ObsLayout()
+            mean = torch.zeros(layout.pose_dim, device=device)
+            std = torch.ones(layout.pose_dim, device=device)
             print("no checkpoint loaded — running model-free analytical MPC.", flush=True)
 
+    pose_dim = layout.pose_dim
     expected_obs_dim = int(mean.shape[-1])
-    needs_lidar = expected_obs_dim > POSE_DIM and not args.no_lidar
-    if expected_obs_dim > POSE_DIM and args.no_lidar:
+    n_rays_expected = expected_obs_dim - pose_dim
+    needs_lidar = n_rays_expected > 0 and not args.no_lidar
+    print(f"layout={layout.yaw_encoding}  pose_dim={pose_dim}  obs_dim={expected_obs_dim}",
+          flush=True)
+    if n_rays_expected > 0 and args.no_lidar:
         print(f"[WARN] checkpoint expects obs_dim={expected_obs_dim} but --no-lidar was set; "
               f"rays will be filled with 1.0 (clear).", flush=True)
-    if args.obstacle_weight > 0.0 and expected_obs_dim == POSE_DIM:
+    if args.obstacle_weight > 0.0 and n_rays_expected <= 0:
         print("[WARN] --obstacle-weight > 0 but checkpoint has no ray columns; penalty is a no-op.",
               flush=True)
 
@@ -169,7 +175,7 @@ def main() -> None:
     if lidar is not None:
         lidar.start()
         print(f"starting lidar reader (obs_dim={expected_obs_dim}, "
-              f"{expected_obs_dim - POSE_DIM} ray bins)…", flush=True)
+              f"{n_rays_expected} ray bins)…", flush=True)
         if not lidar.wait_ready(timeout=10.0):
             reader.stop()
             lidar.stop()
@@ -209,8 +215,9 @@ def main() -> None:
                 dtype=np.float32,
             )
 
-            pose_vec = np.array([x, y, yaw, float(s[3]), float(s[4])], dtype=np.float32)
-            if expected_obs_dim > POSE_DIM:
+            pose_raw = np.array([x, y, yaw, float(s[3]), float(s[4])], dtype=np.float32)
+            pose_vec = layout.encode(pose_raw).astype(np.float32)
+            if n_rays_expected > 0:
                 if lidar is not None:
                     rays_vec = lidar.get_rays().astype(np.float32)
                 else:
@@ -229,7 +236,7 @@ def main() -> None:
                 discount=args.discount,
                 device=device, seed=args.seed,
                 dynamics=args.dynamics, cost=args.cost,
-                hybrid_pose_mode=args.hybrid_pose_mode,
+                hybrid_pose_mode=args.hybrid_pose_mode, layout=layout,
                 action_dt=dt, reward_cfg=reward_cfg,
                 obstacle_weight=float(args.obstacle_weight),
                 obstacle_safety=float(args.safety_radius),
@@ -246,8 +253,8 @@ def main() -> None:
             if info.get("preds_world") is not None:
                 last_sent_pose = np.asarray(info["preds_world"][0], dtype=np.float32)
 
-            if expected_obs_dim > POSE_DIM and len(s0) > POSE_DIM:
-                ray_min_m = float(np.min(s0[POSE_DIM:])) * RAY_MAX_RANGE
+            if n_rays_expected > 0 and len(s0) > pose_dim:
+                ray_min_m = float(np.min(s0[pose_dim:])) * RAY_MAX_RANGE
             else:
                 ray_min_m = float("nan")
 
